@@ -4,14 +4,19 @@ import asyncio
 from unittest import mock
 
 import pytest
+from zha.application import Platform
+from zha.exceptions import ZHAException
+from zha.quirks import DEVICE_REGISTRY
 from zigpy.exceptions import DeliveryError
 from zigpy.zcl import ClusterType, foundation
 
 from tests.common import ClusterListener
+from tests.zha_helpers import join_device_from_diagnostics, zha_gateway
 import zhaquirks
 from zhaquirks.sonoff.snzb06p24 import (
     SonoffSNZB06P24FC11Cluster,
     SonoffSNZB06P24LocalCluster,
+    SonoffZoneSwitch,
     SpatialLearningSubCommand,
     SpatialLearningUiState,
 )
@@ -24,14 +29,16 @@ ZONE_MASK = FC11.AttributeDefs.zone_enable
 UI_STATE = LOCAL.AttributeDefs.spatial_learning_ui_state
 COUNTDOWN = LOCAL.AttributeDefs.spatial_learning_countdown
 
-ZONES = (
-    LOCAL.AttributeDefs.zone_0_enable,
-    LOCAL.AttributeDefs.zone_2_enable,
-    LOCAL.AttributeDefs.zone_3_enable,
-    LOCAL.AttributeDefs.zone_4_enable,
-    LOCAL.AttributeDefs.zone_5_enable,
-    LOCAL.AttributeDefs.zone_6_enable,
-    LOCAL.AttributeDefs.zone_7_enable,
+DIAGNOSTICS = "sonoff-snzb-06p24-0x00001000.json"
+IEEE = "ab:cd:ef:12:8e:52:68:76"
+ZONE_SUFFIXES = (
+    "zone_0_enable",
+    "zone_2_enable",
+    "zone_3_enable",
+    "zone_4_enable",
+    "zone_5_enable",
+    "zone_6_enable",
+    "zone_7_enable",
 )
 
 SEQUENCE = 1_700_000_000_000
@@ -54,23 +61,34 @@ def write_response(status=foundation.Status.SUCCESS):
     ]
 
 
-def read_response(value):
-    """Build a raw read attributes response for the zone mask."""
+async def join_with_zone_mask(gateway, mask):
+    """Join the device from its diagnostics, with the given zone mask."""
+    device = await join_device_from_diagnostics(gateway, DIAGNOSTICS, DEVICE_REGISTRY)
+    device.device.endpoints[1].sonoff_manufacturer.update_attribute(ZONE_MASK.id, mask)
+    # Like a restart, after which the mask was read
+    await device.recompute_entities()
+    return device
+
+
+def zone_switches(device):
+    """Return the zone switches of the device, zone 1 first."""
     return [
-        [
-            foundation.ReadAttributeRecord(
-                attrid=ZONE_MASK.id,
-                status=foundation.Status.SUCCESS,
-                value=foundation.TypeValue(type=ZONE_MASK.zcl_type, value=value),
-            )
-        ]
+        device.get_platform_entity(Platform.SWITCH, unique_id=f"{IEEE}-1-{suffix}")
+        for suffix in ZONE_SUFFIXES
     ]
 
 
-def test_snzb06p24_clusters(snzb06p24):
-    """Test the quirk replaces FC11 and adds the local cluster."""
-    assert isinstance(snzb06p24.endpoints[1].sonoff_manufacturer, FC11)
-    assert isinstance(snzb06p24.endpoints[1].sonoff_presence_local, LOCAL)
+async def test_snzb06p24_zone_switches_need_mask():
+    """Test the zone switches are only created once the mask is known."""
+    async with zha_gateway() as gateway:
+        device = await join_device_from_diagnostics(
+            gateway, DIAGNOSTICS, DEVICE_REGISTRY
+        )
+
+        assert not any(
+            isinstance(entity, SonoffZoneSwitch)
+            for entity in device.platform_entities.values()
+        )
 
 
 @pytest.mark.parametrize(
@@ -84,162 +102,92 @@ def test_snzb06p24_clusters(snzb06p24):
         (0x0014, (False, True, False, True, False, False, False)),
     ],
 )
-def test_snzb06p24_zone_mask_to_switches(snzb06p24, mask, expected):
-    """Test zone mask updates set the zone switches."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
+async def test_snzb06p24_zone_switches(mask, expected):
+    """Test the zone switches follow the zone mask."""
+    async with zha_gateway() as gateway:
+        device = await join_with_zone_mask(gateway, mask)
 
-    fc11.update_attribute(ZONE_MASK.id, mask)
-
-    assert tuple(local.get(zone.id) for zone in ZONES) == expected
-
-
-async def test_snzb06p24_zone_switches_read_locally(snzb06p24):
-    """Test zone switches are answered locally and keyed as requested."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, 0x00FB)
-
-    with mock.patch.object(fc11, "read_attributes_raw") as fc11_read:
-        success, failure = await local.read_attributes(
-            [ZONES[0].name, ZONES[1].id, UI_STATE.name]
-        )
-
-    assert fc11_read.call_count == 0
-    assert success == {
-        ZONES[0].name: True,
-        ZONES[1].id: False,
-        UI_STATE.name: SpatialLearningUiState.Idle,
-    }
-    assert failure == {}
-
-
-async def test_snzb06p24_mask_read_on_configuration(snzb06p24):
-    """Test the zone mask is read when the device is configured."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-
-    with mock.patch.object(
-        fc11, "_read_attributes", mock.AsyncMock(return_value=read_response(0x00F3))
-    ) as fc11_read:
-        await snzb06p24.apply_custom_configuration()
-
-    assert fc11_read.call_args[0][0] == [ZONE_MASK.id]
-    assert fc11_read.call_args.kwargs["manufacturer"] is None
-    assert tuple(local.get(zone.id) for zone in ZONES) == (
-        (True, False, False) + (True,) * 4
-    )
+        assert tuple(switch.is_on for switch in zone_switches(device)) == expected
 
 
 @pytest.mark.parametrize(
-    ("zone", "value", "mask", "expected_mask"),
+    ("zone", "state", "mask", "expected_mask"),
     [
-        (ZONES[0], False, 0x01FF, 0x01FC),
-        (ZONES[0], True, 0x01F0, 0x01F3),
-        (ZONES[2], False, 0x01FF, 0x01F7),
-        (ZONES[6], True, 0x0000, 0x0080),
+        (0, False, 0x01FF, 0x01FC),
+        (0, True, 0x01F0, 0x01F3),
+        (2, False, 0x01FF, 0x01F7),
+        (6, True, 0x0000, 0x0080),
     ],
 )
-async def test_snzb06p24_zone_write(snzb06p24, zone, value, mask, expected_mask):
-    """Test a zone switch write changes only its bits in the device mask."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, mask)
+async def test_snzb06p24_zone_write(zone, state, mask, expected_mask):
+    """Test a zone switch changes only its bits in the device mask."""
+    async with zha_gateway() as gateway:
+        device = await join_with_zone_mask(gateway, mask)
+        switch = zone_switches(device)[zone]
+        fc11 = switch._cluster
 
-    with mock.patch.object(
-        fc11, "write_attributes_raw", mock.AsyncMock(return_value=write_response())
-    ) as fc11_write:
-        # ZHA passes the manufacturer code through
-        result = await local.write_attributes(
-            {zone.name: value}, manufacturer=foundation.UNDEFINED
-        )
-
-    assert result == [
-        [
-            foundation.WriteAttributesStatusRecord(
-                foundation.Status.SUCCESS, ZONE_MASK.id
-            )
-        ]
-    ]
-    written = fc11_write.call_args[0][0]
-    assert fc11_write.call_args.kwargs["manufacturer_code"] is None
-    assert len(written) == 1
-    assert written[0].attrid == ZONE_MASK.id
-    assert written[0].value.value == expected_mask
-    assert fc11.get(ZONE_MASK.id) == expected_mask
-    assert local.get(zone.id) == value
-
-
-async def test_snzb06p24_failed_zone_write(snzb06p24):
-    """Test a rejected mask write leaves the zone switches untouched."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, 0x00FF)
-    listener = ClusterListener(local)
-
-    with mock.patch.object(
-        fc11,
-        "write_attributes_raw",
-        mock.AsyncMock(return_value=write_response(foundation.Status.FAILURE)),
-    ):
-        result = await local.write_attributes({ZONES[1].name: False})
-
-    assert result == [
-        [
-            foundation.WriteAttributesStatusRecord(
-                foundation.Status.FAILURE, ZONE_MASK.id
-            )
-        ]
-    ]
-    assert listener.attribute_updates == []
-    assert local.get(ZONES[1].id) is True
-    assert fc11.get(ZONE_MASK.id) == 0x00FF
-
-
-async def test_snzb06p24_zone_write_reads_unknown_mask(snzb06p24):
-    """Test the mask is read from the device before a write if not cached."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-
-    with (
-        mock.patch.object(
-            fc11,
-            "_read_attributes",
-            mock.AsyncMock(return_value=read_response(0x00F0)),
-        ),
-        mock.patch.object(
+        with mock.patch.object(
             fc11, "write_attributes_raw", mock.AsyncMock(return_value=write_response())
-        ) as fc11_write,
-    ):
-        await fc11.endpoint.sonoff_presence_local.write_attributes(
-            {ZONES[0].name: True}
-        )
+        ) as fc11_write:
+            await switch.async_turn_on_off(state)
 
-    assert fc11_write.call_args[0][0][0].value.value == 0x00F3
+        written = fc11_write.call_args[0][0]
+        assert fc11_write.call_args.kwargs["manufacturer_code"] is None
+        assert len(written) == 1
+        assert written[0].attrid == ZONE_MASK.id
+        assert written[0].value.value == expected_mask
+        assert fc11.get(ZONE_MASK.id) == expected_mask
+        assert switch.is_on is state
 
 
-async def test_snzb06p24_zone_write_unreadable_mask(snzb06p24):
-    """Test nothing is written when the current mask cannot be read."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
+async def test_snzb06p24_failed_zone_write():
+    """Test a rejected mask write leaves the zone switches untouched."""
+    async with zha_gateway() as gateway:
+        device = await join_with_zone_mask(gateway, 0x00FF)
+        switch = zone_switches(device)[1]
+        fc11 = switch._cluster
 
-    with (
-        mock.patch.object(
-            fc11,
-            "_read_attributes",
-            mock.AsyncMock(return_value=[foundation.Status.UNSUP_GENERAL_COMMAND]),
-        ),
-        mock.patch.object(fc11, "write_attributes_raw") as fc11_write,
-    ):
-        result = await local.write_attributes({ZONES[0].name: True})
+        with (
+            mock.patch.object(
+                fc11,
+                "write_attributes_raw",
+                mock.AsyncMock(return_value=write_response(foundation.Status.FAILURE)),
+            ),
+            pytest.raises(ZHAException),
+        ):
+            await switch.async_turn_off()
 
-    assert fc11_write.call_count == 0
-    assert result == [
-        [
-            foundation.WriteAttributesStatusRecord(
-                foundation.Status.UNSUP_GENERAL_COMMAND, ZONE_MASK.id
-            )
-        ]
-    ]
+        assert fc11.get(ZONE_MASK.id) == 0x00FF
+        assert switch.is_on is True
+
+
+async def test_snzb06p24_concurrent_zone_writes():
+    """Test concurrent switch changes keep both changes in the device mask."""
+    async with zha_gateway() as gateway:
+        device = await join_with_zone_mask(gateway, 0x01FF)
+        switches = zone_switches(device)
+        fc11 = switches[0]._cluster
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        masks = []
+
+        async def delayed_write(attributes, **kwargs):
+            masks.append(int(attributes[0].value.value))
+            if len(masks) == 1:
+                entered.set()
+                await release.wait()
+            return write_response()
+
+        with mock.patch.object(fc11, "write_attributes_raw", side_effect=delayed_write):
+            first = asyncio.create_task(switches[1].async_turn_off())
+            await entered.wait()
+            second = asyncio.create_task(switches[2].async_turn_off())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second)
+
+        assert masks == [0x01FB, 0x01F3]
+        assert fc11.get(ZONE_MASK.id) == 0x01F3
 
 
 @pytest.mark.parametrize("status", [foundation.Status.SUCCESS, None])
@@ -403,105 +351,6 @@ async def test_snzb06p24_learning_default_response(snzb06p24):
 
     assert default_rsp.call_count == 1
     fc11.endpoint.sonoff_presence_local._cancel_tasks()
-
-
-async def test_snzb06p24_local_write_stays_local(snzb06p24):
-    """Test writes to attributes other than the zones never reach the device."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-
-    with mock.patch.object(fc11, "write_attributes_raw") as fc11_write:
-        result = await local.write_attributes({COUNTDOWN.name: 5})
-
-    assert fc11_write.call_count == 0
-    assert result == [
-        [foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]
-    ]
-    assert local.get(COUNTDOWN.id) == 5
-
-
-async def test_snzb06p24_concurrent_zone_writes(snzb06p24):
-    """Concurrent switch changes must preserve both changes in the device mask."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, 0x01FF)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    masks = []
-
-    async def delayed_write(attributes, **kwargs):
-        masks.append(int(attributes[0].value.value))
-        if len(masks) == 1:
-            entered.set()
-            await release.wait()
-        return write_response()
-
-    with mock.patch.object(fc11, "write_attributes_raw", side_effect=delayed_write):
-        first = asyncio.create_task(local.write_attributes({ZONES[1].name: False}))
-        await entered.wait()
-        second = asyncio.create_task(local.write_attributes({ZONES[2].name: False}))
-        await asyncio.sleep(0)
-        release.set()
-        await asyncio.gather(first, second)
-
-    assert masks == [0x01FB, 0x01F3]
-    assert fc11.get(ZONE_MASK.id) == 0x01F3
-    assert local.get(ZONES[1].id) is False
-    assert local.get(ZONES[2].id) is False
-
-
-async def test_snzb06p24_zone_write_after_uncached_write(snzb06p24):
-    """A write without cache updates must not make the next write undo it."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, 0x01FF)
-
-    with (
-        mock.patch.object(
-            fc11, "write_attributes_raw", mock.AsyncMock(return_value=write_response())
-        ) as write,
-        mock.patch.object(
-            fc11, "_read_attributes", mock.AsyncMock(return_value=read_response(0x01FB))
-        ) as read,
-    ):
-        await local.write_attributes({ZONES[1].name: False}, update_cache=False)
-        assert local.get(ZONES[1].id) is True
-        await local.write_attributes({ZONES[2].name: False})
-
-    assert read.await_count == 1
-    assert write.call_args[0][0][0].value.value == 0x01F3
-
-
-@pytest.mark.parametrize(
-    "error", [DeliveryError("no acknowledgement"), asyncio.CancelledError()]
-)
-async def test_snzb06p24_zone_write_after_interruption(snzb06p24, error):
-    """Read back after an interrupted write that may have reached the device."""
-    fc11 = snzb06p24.endpoints[1].sonoff_manufacturer
-    local = snzb06p24.endpoints[1].sonoff_presence_local
-    fc11.update_attribute(ZONE_MASK.id, 0x01FF)
-
-    with (
-        mock.patch.object(
-            fc11, "write_attributes_raw", mock.AsyncMock(side_effect=error)
-        ),
-        pytest.raises(type(error)),
-    ):
-        await local.write_attributes({ZONES[1].name: False})
-
-    assert local.get(ZONES[1].id) is True
-    with (
-        mock.patch.object(
-            fc11, "_read_attributes", mock.AsyncMock(return_value=read_response(0x01FB))
-        ) as read,
-        mock.patch.object(
-            fc11, "write_attributes_raw", mock.AsyncMock(return_value=write_response())
-        ) as write,
-    ):
-        await local.write_attributes({ZONES[2].name: False})
-
-    assert read.await_count == 1
-    assert write.call_args[0][0][0].value.value == 0x01F3
 
 
 @pytest.mark.parametrize(
